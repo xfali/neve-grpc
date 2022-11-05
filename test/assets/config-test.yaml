@@ -1,0 +1,12 @@
+neve:
+  grpc:
+    server:
+      port:
+        8081
+      tls:
+        cert:
+        key:
+      readTimeout: 15
+      writeTimeout: 15
+      log:
+        enable: true
