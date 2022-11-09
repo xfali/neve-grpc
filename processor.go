@@ -18,19 +18,25 @@
 package nevegrpc
 
 import (
+	"crypto/tls"
+	"fmt"
 	"github.com/xfali/fig"
 	"github.com/xfali/neve-core/bean"
 	"github.com/xfali/neve-grpc/logger"
 	"github.com/xfali/neve-grpc/server"
 	"github.com/xfali/xlog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
+	"net"
 )
 
 type processor struct {
-	logger          xlog.Logger
-	srvConf         *serverConf
-	srv             *grpc.Server
+	logger  xlog.Logger
+	srvConf *serverConf
+	srv     *grpc.Server
+	cert    *tls.Certificate
+
 	serversRegistry []server.RegistrarAware
 }
 
@@ -80,8 +86,54 @@ func (p *processor) Classify(o interface{}) (bool, error) {
 }
 
 func (p *processor) Process() error {
-	for _, sr := range p.serversRegistry {
-		sr.RegisterService(p.srv)
+	err := p.processServer()
+	if err != nil {
+		p.logger.Errorln(err)
+		return err
+	}
+	return p.processClient()
+}
+
+func (p *processor) processClient() error {
+	return nil
+}
+
+func (p *processor) processServer() error {
+	if p.srvConf != nil && p.srvConf.Port != 0 {
+		lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d",
+			p.srvConf.Host, p.srvConf.Port))
+		if err != nil {
+			return err
+		}
+
+		var creds credentials.TransportCredentials
+		if p.srvConf.Tls.Key != "" && p.srvConf.Tls.Cert != "" {
+			creds, err = credentials.NewServerTLSFromFile(
+				p.srvConf.Tls.Cert,
+				p.srvConf.Tls.Key)
+			if err != nil {
+				return err
+			}
+		} else {
+			if p.cert != nil {
+				creds = credentials.NewServerTLSFromCert(p.cert)
+			}
+		}
+		if creds != nil {
+			p.srv = grpc.NewServer(grpc.Creds(creds))
+		} else {
+			p.srv = grpc.NewServer()
+		}
+
+		for _, sr := range p.serversRegistry {
+			sr.RegisterService(p.srv)
+		}
+
+		go func() {
+			p.logger.Warnln(p.srv.Serve(lis))
+		}()
+	} else {
+		p.logger.Warnln("neve grpc run without server. ")
 	}
 	return nil
 }
