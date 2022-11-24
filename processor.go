@@ -18,9 +18,12 @@
 package nevegrpc
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"github.com/xfali/fig"
+	"github.com/xfali/goutils/idUtil"
 	"github.com/xfali/neve-core/bean"
 	"github.com/xfali/neve-grpc/logger"
 	"github.com/xfali/neve-grpc/server"
@@ -31,11 +34,17 @@ import (
 	"net"
 )
 
+type marshalFunc func(v interface{}) ([]byte, error)
+
 type processor struct {
-	logger  xlog.Logger
+	logger xlog.Logger
+
 	srvConf *serverConf
 	srv     *grpc.Server
 	cert    *tls.Certificate
+
+	marshalFunc     marshalFunc
+	recoveryHandler func(err error) error
 
 	serversRegistry []server.RegistrarAware
 }
@@ -47,6 +56,7 @@ type serverConf struct {
 	WriteTimeout int    `json:"writeTimeout" yaml:"writeTimeout"`
 
 	Tls tlsConf `json:"tls" yaml:"tls"`
+	Log logConf `json:"log" yaml:"log"`
 }
 
 type tlsConf struct {
@@ -54,11 +64,16 @@ type tlsConf struct {
 	Key  string `json:"key" yaml:"key"`
 }
 
+type logConf struct {
+	Disable bool `json:"disable" yaml:"disable"`
+}
+
 type Opt func(processor *processor)
 
 func NewProcessor(opts ...Opt) *processor {
 	ret := &processor{
-		logger: xlog.GetLogger(),
+		logger:      xlog.GetLogger(),
+		marshalFunc: json.Marshal,
 	}
 	for _, opt := range opts {
 		opt(ret)
@@ -119,10 +134,18 @@ func (p *processor) processServer() error {
 				creds = credentials.NewServerTLSFromCert(p.cert)
 			}
 		}
-		if creds != nil {
-			p.srv = grpc.NewServer(grpc.Creds(creds))
+		var opts grpc.ServerOption
+		if !p.srvConf.Log.Disable {
+			opts = grpc.ChainUnaryInterceptor(p.recoveryFunc, p.loggingFunc)
 		} else {
-			p.srv = grpc.NewServer()
+			opts = grpc.ChainUnaryInterceptor(p.recoveryFunc)
+		}
+		if creds != nil {
+			p.srv = grpc.NewServer(
+				grpc.Creds(creds),
+				opts)
+		} else {
+			p.srv = grpc.NewServer(opts)
 		}
 
 		for _, sr := range p.serversRegistry {
@@ -143,4 +166,65 @@ func (p *processor) BeanDestroy() error {
 		p.srv.Stop()
 	}
 	return nil
+}
+
+func (p *processor) recoveryFunc(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if o := recover(); o != nil {
+			if v, ok := o.(error); ok {
+				err = v
+			} else {
+				err = fmt.Errorf("%v", o)
+			}
+			if p.recoveryHandler != nil {
+				err = p.recoveryHandler(err)
+			} else {
+				p.logger.Errorln(err)
+			}
+		}
+	}()
+	return handler(ctx, req)
+}
+
+func (p *processor) loggingFunc(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (resp interface{}, err error) {
+	reqV := defaultMarshal(req, p.marshalFunc)
+	id := idUtil.RandomId(32)
+	p.logger.Infof("Grpc server Request[%s]: %s request: %s\n",
+		id, info.FullMethod, reqV)
+	resp, err = handler(ctx, req)
+	if err != nil {
+		p.logger.Infof("Grpc server Response[%s]: %s err: %s response: %s\n")
+	} else {
+		respV := defaultMarshal(resp, p.marshalFunc)
+		p.logger.Infof("Grpc server Response[%s]: %s response: %s\n",
+			id, info.FullMethod, respV)
+	}
+	return resp, err
+}
+
+func defaultMarshal(v interface{}, f marshalFunc) string {
+	d, err := f(v)
+	if err == nil {
+		return string(d)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+type svrOpts struct {
+}
+
+var ServerOpts svrOpts
+
+func (o svrOpts) RecoveryHandler(h func(error) error) Opt {
+	return func(processor *processor) {
+		processor.recoveryHandler = h
+	}
 }
