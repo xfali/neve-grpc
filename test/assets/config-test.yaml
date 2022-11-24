@@ -6,7 +6,6 @@ neve:
       tls:
         cert:
         key:
-      readTimeout: 15
-      writeTimeout: 15
+      connectTimeout: 120
       log:
         disable: false

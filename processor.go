@@ -32,6 +32,11 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
 	"net"
+	"time"
+)
+
+const (
+	defaultConnectTimeout = 120
 )
 
 type marshalFunc func(v interface{}) ([]byte, error)
@@ -47,13 +52,13 @@ type processor struct {
 	recoveryHandler func(err error) error
 
 	serversRegistry []server.RegistrarAware
+	interceptors    []server.UnaryServerInterceptor
 }
 
 type serverConf struct {
-	Host         string `json:"host" yaml:"host"`
-	Port         int    `json:"port" yaml:"port"`
-	ReadTimeout  int    `json:"readTimeout" yaml:"readTimeout"`
-	WriteTimeout int    `json:"writeTimeout" yaml:"writeTimeout"`
+	Host           string        `json:"host" yaml:"host"`
+	Port           int           `json:"port" yaml:"port"`
+	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
 
 	Tls tlsConf `json:"tls" yaml:"tls"`
 	Log logConf `json:"log" yaml:"log"`
@@ -86,6 +91,9 @@ func (p *processor) Init(conf fig.Properties, container bean.Container) error {
 	err := conf.GetValue("neve.grpc.server", p.srvConf)
 	if err != nil {
 		return err
+	}
+	if p.srvConf.ConnectTimeout == 0 {
+		p.srvConf.ConnectTimeout = defaultConnectTimeout
 	}
 	grpclog.SetLoggerV2(logger.New(p.logger))
 	return nil
@@ -134,18 +142,20 @@ func (p *processor) processServer() error {
 				creds = credentials.NewServerTLSFromCert(p.cert)
 			}
 		}
-		var opts grpc.ServerOption
+		interceptors := make([]server.UnaryServerInterceptor, 0, 2+len(p.interceptors))
+		interceptors = append(interceptors, p.recoveryFunc)
 		if !p.srvConf.Log.Disable {
-			opts = grpc.ChainUnaryInterceptor(p.recoveryFunc, p.loggingFunc)
-		} else {
-			opts = grpc.ChainUnaryInterceptor(p.recoveryFunc)
+			interceptors = append(interceptors, p.loggingFunc)
 		}
+		interceptors = append(interceptors, p.interceptors...)
 		if creds != nil {
 			p.srv = grpc.NewServer(
+				grpc.ConnectionTimeout(p.srvConf.ConnectTimeout*time.Second),
 				grpc.Creds(creds),
-				opts)
+				grpc.ChainUnaryInterceptor(interceptors...))
 		} else {
-			p.srv = grpc.NewServer(opts)
+			p.srv = grpc.NewServer(grpc.ConnectionTimeout(p.srvConf.ConnectTimeout*time.Second),
+				grpc.ChainUnaryInterceptor(interceptors...))
 		}
 
 		for _, sr := range p.serversRegistry {
@@ -226,5 +236,11 @@ var ServerOpts svrOpts
 func (o svrOpts) RecoveryHandler(h func(error) error) Opt {
 	return func(processor *processor) {
 		processor.recoveryHandler = h
+	}
+}
+
+func (o svrOpts) AddUnaryServerInterceptors(interceptors ...server.UnaryServerInterceptor) Opt {
+	return func(processor *processor) {
+		processor.interceptors = interceptors
 	}
 }
